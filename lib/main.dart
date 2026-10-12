@@ -7,6 +7,7 @@ import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sqflite/sqflite.dart';
 
 // Motor de imagenes. Si algun dia cambia, solo se edita esto.
@@ -17,21 +18,82 @@ const _canal = MethodChannel('kornels/nativo');
 // ---------------- Motor offline (stable-diffusion.cpp) ----------------
 
 class Modelo {
-  final String id, nombre, archivo;
+  final String id, nombre, archivo, url;
   final int mb;
-  const Modelo(this.id, this.nombre, this.archivo, this.mb);
-  String get url =>
-      'https://huggingface.co/second-state/stable-diffusion-v1-5-GGUF/resolve/main/$archivo';
+  const Modelo(this.id, this.nombre, this.archivo, this.mb, this.url);
 }
+
+const _hf = 'https://huggingface.co/second-state/stable-diffusion-v1-5-GGUF/resolve/main/';
 
 const modelos = <Modelo>[
   Modelo('q8', 'SD 1.5 Q8 (mejor calidad)',
-      'stable-diffusion-v1-5-pruned-emaonly-Q8_0.gguf', 1683),
+      'stable-diffusion-v1-5-pruned-emaonly-Q8_0.gguf', 1683,
+      '${_hf}stable-diffusion-v1-5-pruned-emaonly-Q8_0.gguf'),
   Modelo('q4', 'SD 1.5 Q4 (mas ligero)',
-      'stable-diffusion-v1-5-pruned-emaonly-Q4_0.gguf', 1494),
+      'stable-diffusion-v1-5-pruned-emaonly-Q4_0.gguf', 1494,
+      '${_hf}stable-diffusion-v1-5-pruned-emaonly-Q4_0.gguf'),
 ];
 
+// LoRA que permite generar en 4 pasos (modo Turbo)
+const loraLcm = Modelo(
+    'lcm',
+    'LCM LoRA (Turbo)',
+    'lcm-lora-sdv1-5.safetensors',
+    135,
+    'https://huggingface.co/latent-consistency/lcm-lora-sdv1-5/resolve/main/pytorch_lora_weights.safetensors');
+
+class Cfg {
+  static Future<String> get(String k) async {
+    try {
+      return (await SharedPreferences.getInstance()).getString(k) ?? '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  static Future<void> set(String k, String v) async {
+    try {
+      await (await SharedPreferences.getInstance()).setString(k, v.trim());
+    } catch (_) {}
+  }
+
+  static Future<bool> cloudflareListo() async =>
+      (await get('cf_id')).isNotEmpty && (await get('cf_token')).isNotEmpty;
+}
+
+/// Una imagen con FLUX schnell en Cloudflare Workers AI (gratis hasta cierto uso diario).
+Future<List<int>> cloudflareFlux(String prompt, {int steps = 6}) async {
+  final id = await Cfg.get('cf_id');
+  final tok = await Cfg.get('cf_token');
+  final r = await http
+      .post(
+        Uri.parse(
+            'https://api.cloudflare.com/client/v4/accounts/$id/ai/run/@cf/black-forest-labs/flux-1-schnell'),
+        headers: {
+          'Authorization': 'Bearer $tok',
+          'Content-Type': 'application/json'
+        },
+        body: jsonEncode({'prompt': prompt, 'steps': steps}),
+      )
+      .timeout(const Duration(seconds: 90));
+  dynamic j;
+  try {
+    j = jsonDecode(r.body);
+  } catch (_) {}
+  if (r.statusCode != 200 || j is! Map || j['result'] is! Map) {
+    String msg = 'codigo ${r.statusCode}';
+    if (j is Map && j['errors'] is List && (j['errors'] as List).isNotEmpty) {
+      msg = '${(j['errors'] as List).first['message'] ?? msg}';
+    }
+    throw 'Cloudflare: $msg';
+  }
+  final b64 = j['result']['image'];
+  if (b64 is! String) throw 'Cloudflare no devolvio imagen';
+  return base64Decode(b64);
+}
+
 const calidades = <String, int>{
+  'Turbo (4 pasos, LCM)': 4,
   'Rapido (12 pasos)': 12,
   'Normal (20 pasos)': 20,
   'Calidad (28 pasos)': 28,
@@ -256,6 +318,7 @@ class _GeneratorState extends State<Generator> {
   double? progreso;
   String? error;
   File? result;
+  String proveedor = '';
   Cancelador? cancel;
 
   @override
@@ -308,18 +371,66 @@ class _GeneratorState extends State<Generator> {
   }
 
   Future<File> _online(String prompt) async {
-    final wh = sizes[size]!;
-    final seed = Random().nextInt(1 << 30);
-    final uri = Uri.parse(
-        '$kEndpoint${Uri.encodeComponent(_promptCompleto(prompt))}?width=${wh[0]}&height=${wh[1]}&seed=$seed&model=flux&nologo=true');
-    final r = await http.get(uri).timeout(const Duration(seconds: 120));
-    if (r.statusCode != 200 ||
-        !(r.headers['content-type'] ?? '').startsWith('image')) {
-      throw 'El servidor respondio ${r.statusCode}. Espera unos segundos e intenta de nuevo.';
+    final full = _promptCompleto(prompt);
+    final cf = await Cfg.cloudflareListo();
+    final cuadrado = size == 'Cuadrado 1:1';
+    // Cloudflare (FLUX) solo entrega imagen cuadrada; para otras proporciones va primero Pollinations.
+    final orden = !cf
+        ? ['pol']
+        : (cuadrado ? ['cf', 'pol'] : ['pol', 'cf']);
+    String ultimo = 'Sin proveedores disponibles';
+    for (final prov in orden) {
+      try {
+        if (mounted) {
+          setState(() => estado = prov == 'cf'
+              ? 'Generando con FLUX (Cloudflare)...'
+              : 'Generando con Pollinations...');
+        }
+        final File f;
+        if (prov == 'cf') {
+          final bytes = await cloudflareFlux(full);
+          f = await _nuevoArchivo('jpg');
+          await f.writeAsBytes(bytes);
+          proveedor = 'FLUX (Cloudflare)';
+        } else {
+          f = await _pollinations(full);
+          proveedor = 'Pollinations';
+        }
+        return f;
+      } catch (e) {
+        ultimo = '$e';
+      }
     }
-    final f = await _nuevoArchivo('jpg');
-    await f.writeAsBytes(r.bodyBytes);
-    return f;
+    throw ultimo;
+  }
+
+  Future<File> _pollinations(String full) async {
+    final wh = sizes[size]!;
+    Object? err;
+    for (var i = 0; i < 3; i++) {
+      try {
+        final seed = Random().nextInt(1 << 30);
+        final uri = Uri.parse(
+            '$kEndpoint${Uri.encodeComponent(full)}?width=${wh[0]}&height=${wh[1]}&seed=$seed&model=flux&nologo=true');
+        final r = await http.get(uri).timeout(const Duration(seconds: 90));
+        if (r.statusCode != 200 ||
+            !(r.headers['content-type'] ?? '').startsWith('image')) {
+          throw 'codigo ${r.statusCode}';
+        }
+        final f = await _nuevoArchivo('jpg');
+        await f.writeAsBytes(r.bodyBytes);
+        return f;
+      } catch (e) {
+        err = e;
+        if (i < 2) {
+          if (mounted) {
+            setState(() => estado = 'Pollinations ocupado, reintentando (${i + 2}/3)...');
+          }
+          await Future.delayed(Duration(seconds: 8 * (i + 1)));
+        }
+      }
+    }
+    throw 'Pollinations no responde ($err). Configura Cloudflare en el engranaje para mas estabilidad.';
   }
 
   Future<File> _offline(String prompt) async {
@@ -328,25 +439,47 @@ class _GeneratorState extends State<Generator> {
     }
     final mf = await Motor.archivoModelo(modelo);
     if (!await mf.exists()) throw 'Primero descarga el modelo.';
+    final turbo = calidad.startsWith('Turbo');
+    final c = Cancelador();
+    cancel = c;
+    if (turbo && !await Motor.descargado(loraLcm)) {
+      // El modo Turbo necesita un archivo pequeno extra (LCM LoRA, ~135 MB)
+      setState(() {
+        progreso = 0;
+        estado = 'Descargando complemento Turbo...';
+      });
+      await descargarModelo(loraLcm, (h, t) {
+        if (!mounted) return;
+        setState(() {
+          progreso = t > 0 ? h / t : null;
+          estado =
+              'Descargando complemento Turbo ${(h / 1048576).toStringAsFixed(0)} de ${(t / 1048576).toStringAsFixed(0)} MB';
+        });
+      }, c);
+      progreso = null;
+    }
     final salida = await _nuevoArchivo('png');
     final wh = sizesOffline[size]!;
     final pasos = calidades[calidad]!;
     final seed = Random().nextInt(1 << 30);
+    final base = _promptCompleto(prompt);
     final args = <String>[
       '-m', mf.path,
-      '-p', _promptCompleto(prompt),
-      '-n', 'blurry, low quality, deformed, ugly, bad anatomy, watermark, text',
+      '-p', turbo ? '$base<lora:lcm-lora-sdv1-5:1>' : base,
+      if (!turbo) ...[
+        '-n',
+        'blurry, low quality, deformed, ugly, bad anatomy, watermark, text',
+      ],
+      if (turbo) ...['--lora-model-dir', p.dirname(mf.path)],
       '-o', salida.path,
       '-W', '${wh[0]}',
       '-H', '${wh[1]}',
       '--steps', '$pasos',
-      '--cfg-scale', '7.0',
-      '--sampling-method', 'euler_a',
+      '--cfg-scale', turbo ? '1.0' : '7.0',
+      '--sampling-method', turbo ? 'lcm' : 'euler_a',
       '-s', '$seed',
       '-t', '4',
     ];
-    final c = Cancelador();
-    cancel = c;
     setState(() => estado = 'Cargando el modelo...');
     final proc = await Process.start(await Motor.exe(), args,
         workingDirectory: (await getTemporaryDirectory()).path);
@@ -382,6 +515,7 @@ class _GeneratorState extends State<Generator> {
       await s.cancel();
     }
     if (c.cancelado) throw 'Cancelado';
+    proveedor = turbo ? 'Offline Turbo' : 'Offline SD 1.5';
     if (code != 0 || !await salida.exists()) {
       throw 'El motor termino con error ($code).\n${ultimas.join('\n')}';
     }
@@ -503,8 +637,17 @@ class _GeneratorState extends State<Generator> {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
-        Text('Kornels Imagenes',
-            style: Theme.of(context).textTheme.headlineSmall),
+        Row(children: [
+          Expanded(
+              child: Text('Kornels Imagenes',
+                  style: Theme.of(context).textTheme.headlineSmall)),
+          IconButton(
+            tooltip: 'Cuenta Cloudflare (online estable)',
+            icon: const Icon(Icons.settings),
+            onPressed: () => showDialog(
+                context: context, builder: (_) => const CuentaDialog()),
+          ),
+        ]),
         const SizedBox(height: 12),
         SegmentedButton<Modo>(
           segments: const [
@@ -576,9 +719,9 @@ class _GeneratorState extends State<Generator> {
                 onPressed: () => cancel?.cancelar(), child: const Text('Cancelar')),
           ],
         ]),
-        if (loading && offline) ...[
+        if (loading) ...[
           const SizedBox(height: 12),
-          LinearProgressIndicator(value: progreso),
+          if (offline) LinearProgressIndicator(value: progreso),
           const SizedBox(height: 4),
           Text(estado),
         ],
@@ -592,6 +735,11 @@ class _GeneratorState extends State<Generator> {
           ClipRRect(
               borderRadius: BorderRadius.circular(12),
               child: Image.file(result!)),
+          if (proveedor.isNotEmpty)
+            Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Text('Generado con: $proveedor',
+                    style: Theme.of(context).textTheme.bodySmall)),
           const SizedBox(height: 8),
           OutlinedButton.icon(
             onPressed: () => Share.shareXFiles([XFile(result!.path)],
@@ -604,6 +752,88 @@ class _GeneratorState extends State<Generator> {
     );
   }
 }
+
+class CuentaDialog extends StatefulWidget {
+  const CuentaDialog({super.key});
+  @override
+  State<CuentaDialog> createState() => _CuentaDialogState();
+}
+
+class _CuentaDialogState extends State<CuentaDialog> {
+  final id = TextEditingController();
+  final tok = TextEditingController();
+  String msg = '';
+  bool probando = false;
+
+  @override
+  void initState() {
+    super.initState();
+    () async {
+      id.text = await Cfg.get('cf_id');
+      tok.text = await Cfg.get('cf_token');
+      if (mounted) setState(() {});
+    }();
+  }
+
+  Future<void> guardar() async {
+    await Cfg.set('cf_id', id.text);
+    await Cfg.set('cf_token', tok.text);
+  }
+
+  Future<void> probar() async {
+    await guardar();
+    setState(() {
+      probando = true;
+      msg = 'Probando...';
+    });
+    try {
+      await cloudflareFlux('a red apple', steps: 2);
+      msg = 'Conexion correcta. El modo online usara FLUX.';
+    } catch (e) {
+      msg = 'Error: $e';
+    }
+    if (mounted) setState(() => probando = false);
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+        title: const Text('Online estable (Cloudflare)'),
+        content: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            const Text(
+                '1) Crea una cuenta gratis en dash.cloudflare.com (solo correo).\n'
+                '2) Copia tu Account ID (aparece en la pagina principal de la cuenta).\n'
+                '3) En Mi perfil > Tokens de API > Crear token, usa la plantilla "Workers AI" y copia el token.\n'
+                'Con eso la app usa FLUX (mejor calidad, ~5 s). Gratis hasta cierto uso diario.',
+                style: TextStyle(fontSize: 13)),
+            const SizedBox(height: 12),
+            TextField(
+                controller: id,
+                decoration: const InputDecoration(
+                    labelText: 'Account ID', border: OutlineInputBorder())),
+            const SizedBox(height: 8),
+            TextField(
+                controller: tok,
+                obscureText: true,
+                decoration: const InputDecoration(
+                    labelText: 'Token de API', border: OutlineInputBorder())),
+            if (msg.isNotEmpty)
+              Padding(padding: const EdgeInsets.only(top: 8), child: Text(msg)),
+          ]),
+        ),
+        actions: [
+          TextButton(
+              onPressed: probando ? null : probar, child: const Text('Probar')),
+          TextButton(
+              onPressed: () async {
+                await guardar();
+                if (context.mounted) Navigator.pop(context);
+              },
+              child: const Text('Guardar')),
+        ],
+      );
+}
+
 
 class Gallery extends StatelessWidget {
   const Gallery({super.key});
